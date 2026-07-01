@@ -1,0 +1,10 @@
+opencv-python
+scipy
+torch
+torchvision
+matplotlib
+pandas
+pillow
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
