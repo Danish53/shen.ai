@@ -38,7 +38,7 @@ async def scan_websocket(websocket: WebSocket):
 
     async with _scan_lock:
         loop = asyncio.get_running_loop()
-        scanner = VitalsScanner(duration=60, remote_mode=True)
+        scanner = VitalsScanner(duration=30, remote_mode=True)
         scanner.load_model()
 
         try:
@@ -53,7 +53,7 @@ async def scan_websocket(websocket: WebSocket):
 
                 action = msg.get("action")
                 if action == "start":
-                    scanner.start_scan(int(msg.get("duration", 60)))
+                    scanner.start_scan(int(msg.get("duration", 30)))
                     await websocket.send_json({
                         "type": "status",
                         "message": "Scanning…",
@@ -61,13 +61,13 @@ async def scan_websocket(websocket: WebSocket):
                     })
                     continue
                 if action == "stop":
-                    scanner.stop()
+                    scanner.abort_scan()
                     await websocket.send_json({
                         "type": "status",
                         "message": "Stopped",
                         "phase": "preview",
                     })
-                    break
+                    continue
 
                 if msg.get("type") != "frame":
                     continue
@@ -89,7 +89,7 @@ async def scan_websocket(websocket: WebSocket):
                 if event:
                     await websocket.send_json(event)
                     if event.get("type") == "complete":
-                        break
+                        scanner.finish_scan()
 
         except WebSocketDisconnect:
             pass
