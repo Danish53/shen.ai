@@ -8,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from scanner_service import VitalsScanner
 
 _scan_lock = asyncio.Lock()
-_DRAIN_SEC = 0.03
+_DRAIN_SEC = 0.05
+API_VERSION = "1.1.0"
 
 
 async def _drain_pending(ws: WebSocket, first_msg: dict):
@@ -43,7 +44,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="rPPG Vitals API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="rPPG Vitals API", version=API_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,12 +57,26 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "rPPG Vitals API", "model_loaded": True}
+    return {
+        "status": "ok",
+        "service": "rPPG Vitals API",
+        "model_loaded": True,
+        "version": API_VERSION,
+    }
 
 
 async def _handle_finish(loop, scanner, websocket):
     try:
-        event = await loop.run_in_executor(None, scanner.finalize_scan)
+        event = await asyncio.wait_for(
+            loop.run_in_executor(None, scanner.finalize_scan),
+            timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Finalize timed out on server — try again.",
+        })
+        return
     except Exception as exc:
         await websocket.send_json({"type": "error", "message": str(exc)})
         return
@@ -77,6 +92,32 @@ async def scan_websocket(websocket: WebSocket):
         loop = asyncio.get_running_loop()
         scanner = VitalsScanner(duration=30, remote_mode=True)
         scanner.load_model()
+        frame_lock = asyncio.Lock()
+
+        async def process_latest_frame(latest_frame: dict):
+            """Process one frame without blocking the receive loop (slow VPS fix)."""
+            async with frame_lock:
+                if scanner.stop_flag:
+                    return
+                try:
+                    if latest_frame.get("ts") is not None:
+                        scanner.note_client_timestamp(latest_frame["ts"])
+
+                    client_face_ok = latest_frame.get("face_ok", True)
+                    bgr = await loop.run_in_executor(
+                        None, scanner.decode_frame, latest_frame["data"],
+                    )
+                    event = await loop.run_in_executor(
+                        None, partial(scanner.process_frame, bgr, client_face_ok),
+                    )
+                except Exception as exc:
+                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    return
+
+                if event:
+                    await websocket.send_json(event)
+                    if event.get("type") == "complete":
+                        scanner.finish_scan()
 
         try:
             await websocket.send_json({
@@ -106,7 +147,8 @@ async def scan_websocket(websocket: WebSocket):
                     })
                     continue
                 if action == "finish":
-                    await _handle_finish(loop, scanner, websocket)
+                    async with frame_lock:
+                        await _handle_finish(loop, scanner, websocket)
                     continue
 
                 if msg.get("type") != "frame":
@@ -115,7 +157,8 @@ async def scan_websocket(websocket: WebSocket):
                 latest_frame, priority = await _drain_pending(websocket, msg)
 
                 if priority and priority.get("action") == "finish":
-                    await _handle_finish(loop, scanner, websocket)
+                    async with frame_lock:
+                        await _handle_finish(loop, scanner, websocket)
                     continue
                 if priority and priority.get("action") == "start":
                     scanner.start_scan(int(priority.get("duration", 30)))
@@ -134,28 +177,8 @@ async def scan_websocket(websocket: WebSocket):
                     })
                     continue
 
-                if not latest_frame:
-                    continue
-
-                try:
-                    if latest_frame.get("ts") is not None:
-                        scanner.note_client_timestamp(latest_frame["ts"])
-
-                    client_face_ok = latest_frame.get("face_ok", True)
-                    bgr = await loop.run_in_executor(
-                        None, scanner.decode_frame, latest_frame["data"],
-                    )
-                    event = await loop.run_in_executor(
-                        None, partial(scanner.process_frame, bgr, client_face_ok),
-                    )
-                except Exception as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
-                    continue
-
-                if event:
-                    await websocket.send_json(event)
-                    if event.get("type") == "complete":
-                        scanner.finish_scan()
+                if latest_frame:
+                    asyncio.create_task(process_latest_frame(latest_frame))
 
         except WebSocketDisconnect:
             pass
