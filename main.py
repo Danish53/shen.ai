@@ -44,7 +44,10 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="rPPG Vitals API", version=API_VERSION, lifespan=lifespan)
+app = FastAPI(title="rPPG Vitals API", version=API_VERSION, lifespan=lifespan, root_path="/api",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",)
 
 app.add_middleware(
     CORSMiddleware,
