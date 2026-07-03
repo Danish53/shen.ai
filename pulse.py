@@ -22,13 +22,18 @@ class Pulse():
         self.fft_spec = []
         
     def get_pulse(self, mean_rgb):
-        seg_t = 3.2
-        l = int(self.framerate * seg_t)
-        H = np.zeros(self.signal_size)
+        mean_rgb = np.asarray(mean_rgb)
+        n = len(mean_rgb)
+        if n < 8:
+            return np.zeros(max(n, 1))
+
+        # Shorter window when fewer samples (remote scan may finalize before 80 frames).
+        seg_t = min(3.2, max(1.6, n / max(self.framerate, 8.0)))
+        l = max(12, min(int(self.framerate * seg_t), n))
+        H = np.zeros(n)
 
         B = [int(0.8 // (self.framerate / l)), int(4 // (self.framerate / l))]
                 
-        n = len(mean_rgb)
         for t in range(0, max(0, n - l + 1)):
             chunk = mean_rgb[t:t + l, :]
             if chunk.shape[0] < 2:
@@ -60,18 +65,38 @@ class Pulse():
         return H
 
     def get_rfft_hr(self, signal):
+        signal = np.asarray(signal, dtype=float).flatten()
         signal_size = len(signal)
-        signal = signal.flatten()
-        fft_data = np.fft.rfft(signal) # FFT
-        fft_data = np.abs(fft_data)
+        if signal_size < 16:
+            return None
 
-        freq = np.fft.rfftfreq(signal_size, 1./self.framerate) # Frequency data
+        window = np.hanning(signal_size)
+        centered = signal - np.mean(signal)
+        weighted = centered * window
 
-        inds= np.where((freq < self.minFreq) | (freq > self.maxFreq) )[0]
-        fft_data[inds] = 0
-        bps_freq=60.0*freq
-        max_index = np.argmax(fft_data)
-        fft_data[max_index] = fft_data[max_index]**2
+        fft_data = np.abs(np.fft.rfft(weighted))
+        freq = np.fft.rfftfreq(signal_size, 1.0 / self.framerate)
+
+        band = (freq >= self.minFreq) & (freq <= self.maxFreq)
+        if not np.any(band):
+            return None
+
+        fft_band = fft_data.copy()
+        fft_band[~band] = 0
+
+        peak_idx = int(np.argmax(fft_band))
+        peak_freq = float(freq[peak_idx])
+        peak_mag = float(fft_band[peak_idx])
+
+        # Prefer fundamental over 2× harmonic (common rPPG error → inflated HR).
+        if peak_freq > 1.2 and peak_mag > 0:
+            half_freq = peak_freq / 2.0
+            if half_freq >= self.minFreq:
+                half_idx = int(np.argmin(np.abs(freq - half_freq)))
+                half_mag = float(fft_band[half_idx])
+                if half_mag > 0.5 * peak_mag:
+                    peak_freq = float(freq[half_idx])
+
+        fft_data[peak_idx] = fft_data[peak_idx] ** 2
         self.fft_spec.append(fft_data)
-        HR =  bps_freq[max_index]
-        return HR
+        return peak_freq * 60.0

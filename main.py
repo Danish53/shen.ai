@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from functools import partial
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,6 +69,15 @@ async def scan_websocket(websocket: WebSocket):
                         "phase": "preview",
                     })
                     continue
+                if action == "finish":
+                    try:
+                        event = await loop.run_in_executor(None, scanner.finalize_scan)
+                    except Exception as exc:
+                        await websocket.send_json({"type": "error", "message": str(exc)})
+                        continue
+                    await websocket.send_json(event)
+                    scanner.finish_scan()
+                    continue
 
                 if msg.get("type") != "frame":
                     continue
@@ -80,8 +90,11 @@ async def scan_websocket(websocket: WebSocket):
                     if msg.get("ts") is not None:
                         scanner.note_client_timestamp(msg["ts"])
 
+                    client_face_ok = msg.get("face_ok", True)
                     bgr = await loop.run_in_executor(None, scanner.decode_frame, jpeg_b64)
-                    event = await loop.run_in_executor(None, scanner.process_frame, bgr)
+                    event = await loop.run_in_executor(
+                        None, partial(scanner.process_frame, bgr, client_face_ok),
+                    )
                 except Exception as exc:
                     await websocket.send_json({"type": "error", "message": str(exc)})
                     continue
