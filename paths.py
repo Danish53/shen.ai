@@ -2,6 +2,11 @@ from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BACKEND_DIR / "linknet.pth"
+DEEPPHYS_WEIGHTS_PATH = BACKEND_DIR / "weights" / "PURE_DeepPhys.pth"
+DEEPPHYS_WEIGHTS_URL = (
+    "https://raw.githubusercontent.com/ubicomplab/rPPG-Toolbox/main/"
+    "final_model_release/PURE_DeepPhys.pth"
+)
 OUTPUT_DIR = BACKEND_DIR / "output"
 IMAGES_DIR = BACKEND_DIR / "images"
 

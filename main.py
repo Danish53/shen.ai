@@ -6,10 +6,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from scanner_service import VitalsScanner
+from ml_pulse import ml_pulse_available, ml_pulse_error
 
 _scan_lock = asyncio.Lock()
 _DRAIN_SEC = 0.05
-API_VERSION = "1.1.0"
+API_VERSION = "1.3.3"
 
 
 async def _drain_pending(ws: WebSocket, first_msg: dict):
@@ -64,6 +65,9 @@ def health():
         "status": "ok",
         "service": "rPPG Vitals API",
         "model_loaded": True,
+        "ml_pulse_loaded": ml_pulse_available(),
+        "ml_breathing": ml_pulse_available(),
+        "ml_pulse_error": ml_pulse_error() if not ml_pulse_available() else None,
         "version": API_VERSION,
     }
 
@@ -107,11 +111,13 @@ async def scan_websocket(websocket: WebSocket):
                         scanner.note_client_timestamp(latest_frame["ts"])
 
                     client_face_ok = latest_frame.get("face_ok", True)
+                    forehead_roi = latest_frame.get("forehead_roi")
                     bgr = await loop.run_in_executor(
                         None, scanner.decode_frame, latest_frame["data"],
                     )
                     event = await loop.run_in_executor(
-                        None, partial(scanner.process_frame, bgr, client_face_ok),
+                        None,
+                        partial(scanner.process_frame, bgr, client_face_ok, forehead_roi),
                     )
                 except Exception as exc:
                     await websocket.send_json({"type": "error", "message": str(exc)})

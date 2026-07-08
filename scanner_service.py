@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 
 from models import LinkNet34
 from pulse import Pulse
+from ml_pulse import DeepPulseEstimator, preload_deepphys, ml_pulse_available
 from respiration import (
     estimate_rr_robust,
     estimate_rr_short,
@@ -81,6 +82,7 @@ class VitalsScanner:
         self._last_mask = None
         self._last_pred = None
         self._frame_i = 0
+        self.ml_pulse = DeepPulseEstimator()
 
     def _push_signal_sample(self, bgr_mean):
         """One RGB sample per frame — avoids waiting for batches of 5."""
@@ -92,18 +94,27 @@ class VitalsScanner:
             self.signal[self._signal_filled] = row[0]
         self._signal_filled += 1
 
-    def _ingest_face_frame(self, frame, scan_mask, chest_y0):
+    def _skin_sample_mask(self, h, w, chest_y0, scan_mask, forehead_roi=None):
+        """Forehead ROI is best for pulse — fall back to full face mask."""
+        roi = self._mask_from_forehead_roi(h, w, chest_y0, forehead_roi)
+        if roi is not None and int(roi.sum()) >= 20:
+            return roi
+        return scan_mask
+
+    def _ingest_face_frame(self, frame, scan_mask, chest_y0, forehead_roi=None):
         """Per-frame skin RGB for remote scans (webcam JPEG)."""
+        h, w = frame.shape[:2]
+        sample_m = self._skin_sample_mask(h, w, chest_y0, scan_mask, forehead_roi)
         fy = chest_y0
-        face_m = scan_mask[:fy, :]
-        if int(face_m.sum()) < 30:
+        face_m = sample_m[:fy, :]
+        if int(face_m.sum()) < 20:
             return False
         pix = frame[:fy][face_m]
         mean_bgr = pix.mean(axis=0)
         self.face_green.append(float(mean_bgr[1]))
         self._push_signal_sample(mean_bgr)
         self.frame_count += 1
-        if self._signal_filled % 3 == 0:
+        if self._signal_filled % 5 == 0 and self._signal_filled >= 40:
             self._try_append_hr()
         br = self._estimate_br(live_only=True)
         if br is not None:
@@ -130,29 +141,50 @@ class VitalsScanner:
         _MODEL_CACHE["model"] = model
         _MODEL_CACHE["transform"] = transform
         _MODEL_CACHE["device"] = device
+        preload_deepphys(device)
+
+    def _push_ml_frame(self, frame, scan_mask, chest_y0, forehead_roi=None):
+        if not ml_pulse_available():
+            return
+        self.ml_pulse.push_frame(
+            frame, scan_mask, forehead_roi=forehead_roi, chest_y0=chest_y0,
+        )
 
     @staticmethod
     def _signal_capacity(duration):
-        """~10 s sliding RGB window — fills early so HR updates during scan."""
-        return max(64, min(256, int(RPPG_TARGET_FPS * 10)))
+        """Hold ~full scan window for stable final FFT."""
+        return max(128, min(int(RPPG_TARGET_FPS * max(duration, 10)), 750))
 
     def _effective_fps(self):
+        """Frame rate from actual samples received — critical for FFT accuracy."""
+        if self._scan_accumulated > 2.0:
+            if len(self.face_green) >= 20:
+                measured = len(self.face_green) / self._scan_accumulated
+                if 8.0 <= measured <= 32.0:
+                    return float(measured)
+            if self.frame_count >= 20:
+                measured = self.frame_count / self._scan_accumulated
+                if 8.0 <= measured <= 32.0:
+                    return float(measured)
+
         if self.remote_mode and self._client_fps_ready:
             fps = float(self.actual_fps)
-            if abs(fps - RPPG_TARGET_FPS) <= 3.5:
-                return RPPG_TARGET_FPS
-            return max(RPPG_MIN_FPS, min(RPPG_MAX_FPS, fps))
-        if self.scan_start_time and self._scan_fps_start:
-            fps = float(self.actual_fps)
-            if abs(fps - RPPG_TARGET_FPS) <= 3.5:
-                return RPPG_TARGET_FPS
-            return max(RPPG_MIN_FPS, min(RPPG_MAX_FPS, fps))
+            if 8.0 <= fps <= 32.0:
+                return fps
+
+        if not self.remote_mode and self._scan_fps_start is not None:
+            elapsed = time.time() - self._scan_fps_start
+            if elapsed > 0.5 and self._scan_frame_count > 10:
+                fps = self._scan_frame_count / elapsed
+                if 8.0 <= fps <= 32.0:
+                    return float(fps)
+
         return RPPG_TARGET_FPS
 
     def note_client_timestamp(self, ts_ms):
         if self._last_client_ts is not None:
             dt = (float(ts_ms) - self._last_client_ts) / 1000.0
-            if 0.028 < dt < 0.12:
+            if 0.02 < dt < 0.25:
                 self._client_ts_buf.append(dt)
                 if len(self._client_ts_buf) > 60:
                     self._client_ts_buf.pop(0)
@@ -349,6 +381,8 @@ class VitalsScanner:
         self._overlay_tick = 0
         self._last_mask = None
         self._last_pred = None
+        if hasattr(self, "ml_pulse") and self.ml_pulse is not None:
+            self.ml_pulse.reset()
 
     @staticmethod
     def _assess_lighting(bgr, skin_mask):
@@ -529,11 +563,13 @@ class VitalsScanner:
             info["motion"] = float(ys.mean() + chest_y0)
         return info, chest_y0
 
-    def _sample_breathing_frame(self, orig, mask_bool, chest_y0, overlay_alpha):
-        """Face-only breathing traces (Shen.ai style — no chest)."""
+    def _sample_breathing_frame(self, orig, mask_bool, chest_y0, overlay_alpha, forehead_roi=None):
+        """Face-only breathing traces — forehead ROI preferred."""
+        h, w = orig.shape[:2]
+        sample_m = self._skin_sample_mask(h, w, chest_y0, mask_bool, forehead_roi)
         fy = chest_y0
-        face_m = mask_bool[:fy, :]
-        if int(face_m.sum()) > 30:
+        face_m = sample_m[:fy, :]
+        if int(face_m.sum()) > 20:
             pix = orig[:fy][face_m]
             self.br_green_trace.append(float(pix[:, 1].mean()))
         if overlay_alpha is not None:
@@ -558,7 +594,28 @@ class VitalsScanner:
         mask[y0:y1, x0:x1] = ellipse
         return mask
 
-    def _scan_mask_for_frame(self, pred_np, chest_y0, h, w, client_face_ok):
+    @staticmethod
+    def _mask_from_forehead_roi(h, w, chest_y0, roi):
+        if not roi or not isinstance(roi, dict):
+            return None
+        try:
+            x0 = int(float(roi.get("x0", 0)) * w)
+            x1 = int(float(roi.get("x1", 1)) * w)
+            y0 = int(float(roi.get("y0", 0)) * h)
+            y1 = int(float(roi.get("y1", 1)) * h)
+        except (TypeError, ValueError):
+            return None
+        y1 = min(y1, chest_y0)
+        if x1 - x0 < 12 or y1 - y0 < 12:
+            return None
+        mask = np.zeros((h, w), dtype=bool)
+        mask[max(0, y0):y1, max(0, x0):x1] = True
+        return mask
+
+    def _scan_mask_for_frame(self, pred_np, chest_y0, h, w, client_face_ok, forehead_roi=None):
+        roi_mask = self._mask_from_forehead_roi(h, w, chest_y0, forehead_roi)
+        if roi_mask is not None and int(roi_mask.sum()) >= 40:
+            return roi_mask
         ai_mask = pred_np > 0.45
         face_count = int(ai_mask[:chest_y0, :].sum())
         if face_count >= 80:
@@ -581,7 +638,7 @@ class VitalsScanner:
             orig = cv2.resize(orig, (640, int(h0 * scale)), interpolation=cv2.INTER_AREA)
         return orig
 
-    def process_frame(self, orig, client_face_ok=True):
+    def process_frame(self, orig, client_face_ok=True, forehead_roi=None):
         """Process one camera frame — used for VPS (browser camera) and local webcam."""
         if self.model is None or self._img_transform is None:
             raise RuntimeError("Model not loaded")
@@ -594,7 +651,7 @@ class VitalsScanner:
         run_model = (
             self._last_pred is None
             or not scanning
-            or self._frame_i % 4 == 0
+            or self._frame_i % 2 == 0
         )
 
         if run_model:
@@ -616,7 +673,9 @@ class VitalsScanner:
         frame_full = orig.copy()
         h, w = shape[0], shape[1]
         region_info, chest_y0 = self.extract_regions(frame_full, mask_bool, pred_np)
-        scan_mask = self._scan_mask_for_frame(pred_np, chest_y0, h, w, client_face_ok)
+        scan_mask = self._scan_mask_for_frame(
+            pred_np, chest_y0, h, w, client_face_ok, forehead_roi,
+        )
         face_skin = region_info["face_skin"]
         overlay_alpha = region_info["overlay_alpha"]
         lighting_score, lighting_msg = self._assess_lighting(frame_full, face_skin)
@@ -633,10 +692,11 @@ class VitalsScanner:
             if tracking_ok:
                 self.face_ok_frames += 1
                 self._sample_breathing_frame(
-                    frame_full, scan_mask, chest_y0, overlay_alpha,
+                    frame_full, scan_mask, chest_y0, overlay_alpha, forehead_roi,
                 )
+                self._push_ml_frame(frame_full, scan_mask, chest_y0, forehead_roi)
                 if self.remote_mode:
-                    self._ingest_face_frame(frame_full, scan_mask, chest_y0)
+                    self._ingest_face_frame(frame_full, scan_mask, chest_y0, forehead_roi)
                 else:
                     masked = frame_full.copy()
                     masked[~scan_mask] = 0
@@ -748,23 +808,182 @@ class VitalsScanner:
             return None
         return rows[mask]
 
-    def _estimate_hr_from_rgb(self, rgb_means):
-        if rgb_means is None or len(rgb_means) < 15:
+    def _fuse_hr_estimates(self, estimates, hr_ml=None):
+        """Reject outliers and resolve 2× harmonic disagreements (e.g. 118 vs 72)."""
+        vals = sorted({round(float(e)) for e in estimates if e is not None and np.isfinite(e)})
+        if not vals:
             return None
-        fs = max(self._effective_fps(), 8.0)
+        if len(vals) == 1:
+            v = vals[0]
+            return v if 52 <= v <= 180 else None
+
+        resolved = []
+        used = set()
+        for i, a in enumerate(vals):
+            if i in used:
+                continue
+            harmonic_partner = None
+            for j, b in enumerate(vals):
+                if j <= i or j in used:
+                    continue
+                ratio = b / max(a, 1e-6)
+                if 1.55 < ratio < 2.2 or 0.45 < ratio < 0.65:
+                    harmonic_partner = b
+                    used.add(j)
+                    break
+                if 1.48 < ratio < 1.82:
+                    harmonic_partner = b
+                    used.add(j)
+                    break
+            if harmonic_partner is not None:
+                pair = sorted([a, harmonic_partner])
+                low, high = pair[0], pair[1]
+                ratio = high / max(low, 1e-6)
+                if 1.48 < ratio < 1.82 and 55 <= low <= 100:
+                    resolved.append(round((low * high) ** 0.5))
+                elif 52 <= low <= 108 and high > low * 1.45:
+                    resolved.append(low)
+                elif 52 <= high <= 140:
+                    resolved.append(high)
+                else:
+                    resolved.append(round(float(np.median(pair))))
+                used.add(i)
+            else:
+                resolved.append(a)
+                used.add(i)
+
+        if not resolved:
+            resolved = vals
+
+        best_cluster = [resolved[0]]
+        for anchor in resolved:
+            cluster = [v for v in resolved if abs(v - anchor) <= 12]
+            if len(cluster) > len(best_cluster):
+                best_cluster = cluster
+
+        if hr_ml is not None and 52 <= hr_ml <= 140:
+            ml_cluster = [v for v in best_cluster if abs(v - hr_ml) <= 12]
+            if ml_cluster:
+                return round(float(np.median(ml_cluster)))
+            if len(best_cluster) == 1:
+                return round(hr_ml)
+
+        if len(best_cluster) < max(1, len(resolved) // 2) and hr_ml is not None:
+            if 52 <= hr_ml <= 140:
+                return round(hr_ml)
+
+        hr = round(float(np.median(best_cluster)))
+        return hr if 52 <= hr <= 180 else None
+
+    def _estimate_hr_from_rgb(self, rgb_means, fs_override=None):
+        if rgb_means is None or len(rgb_means) < 40:
+            return None
+        fs = max(float(fs_override) if fs_override else self._effective_fps(), 10.0)
         self.pulse.framerate = fs
         old_sz = self.pulse.signal_size
+        estimates = []
+        hr_ml = None
         try:
             self.pulse.signal_size = len(rgb_means)
             wave = moving_avg(self.pulse.get_pulse(rgb_means), 6)
-            hr = float(self.pulse.get_rfft_hr(wave))
+            hr_pos = self.pulse.get_rfft_hr(wave)
+            if hr_pos is not None and np.isfinite(hr_pos):
+                estimates.append(float(hr_pos))
+
+            hr_ac = self.pulse.hr_from_autocorr(wave)
+            if hr_ac is not None:
+                estimates.append(float(hr_ac))
+
+            green = rgb_means[:, 1].astype(float)
+            hr_green = Pulse.hr_from_green_trace(green, fs)
+            if hr_green is not None:
+                estimates.append(float(hr_green))
+
+            if ml_pulse_available() and self.ml_pulse.waveform_len >= 60:
+                hr_ml = self.ml_pulse.estimate_hr(fs)
+                if hr_ml is not None:
+                    estimates.append(float(hr_ml))
+                    estimates.append(float(hr_ml))
         finally:
             self.pulse.signal_size = old_sz
-        if np.isfinite(hr) and hr and 42 <= hr <= 185:
-            return round(hr)
-        return None
+
+        if not estimates:
+            return None
+
+        if hr_ml is not None and self.ml_pulse.waveform_len >= 100:
+            agree = [e for e in estimates if abs(e - hr_ml) <= 8]
+            if len(agree) >= 2:
+                return round(float(np.median(agree)))
+
+        return self._fuse_hr_estimates(estimates, hr_ml=hr_ml)
+
+    def _estimate_hr_sliding(self, rgb, fs):
+        """Multiple 12 s windows — median of agreeing segments reduces 78/91 jumps."""
+        fs = max(float(fs), 10.0)
+        skip = min(len(rgb) - 50, max(0, int(fs * 5.0)))
+        trimmed = rgb[skip:] if skip > 0 else rgb
+        win = max(50, int(fs * 12))
+        step = max(20, int(fs * 4))
+        if len(trimmed) < win:
+            return self._estimate_hr_from_rgb(trimmed, fs_override=fs), []
+
+        window_hrs = []
+        for start in range(0, len(trimmed) - win + 1, step):
+            chunk = trimmed[start : start + win]
+            hr = self._estimate_hr_from_rgb(chunk, fs_override=fs)
+            if hr is not None:
+                window_hrs.append(int(hr))
+
+        if not window_hrs:
+            return None, []
+
+        med = float(np.median(window_hrs))
+        cluster = [h for h in window_hrs if abs(h - med) <= 7]
+        if len(cluster) >= 2:
+            return round(float(np.median(cluster))), window_hrs
+        return round(med), window_hrs
+
+    def _estimate_hr_full_window(self):
+        """Final HR — sliding windows + full trace + ML consensus."""
+        rgb = self._valid_signal_rows()
+        if rgb is None or len(rgb) < 80:
+            if len(self.face_green) >= 80:
+                g = np.asarray(self.face_green, dtype=float)
+                rgb = np.column_stack([g, g, g])
+            else:
+                return None
+        fs = self._effective_fps()
+        if self._scan_accumulated > 2.0 and len(self.face_green) >= 40:
+            fs = len(self.face_green) / self._scan_accumulated
+
+        sliding_hr, window_hrs = self._estimate_hr_sliding(rgb, fs)
+        full_hr = self._estimate_hr_from_rgb(
+            rgb[min(len(rgb) - 50, max(0, int(fs * 5.0))):],
+            fs_override=fs,
+        )
+        hr_ml = None
+        if ml_pulse_available() and self.ml_pulse.waveform_len >= 80:
+            hr_ml = self.ml_pulse.estimate_hr(fs)
+
+        candidates = [h for h in (sliding_hr, full_hr, hr_ml) if h is not None]
+        if not candidates:
+            return None
+
+        if hr_ml is not None and self.ml_pulse.waveform_len >= 100:
+            agree = [h for h in candidates if abs(h - hr_ml) <= 7]
+            if len(agree) >= 2:
+                return round(float(np.median(agree)))
+
+        if sliding_hr is not None and full_hr is not None and abs(sliding_hr - full_hr) <= 8:
+            return round(float(np.median([sliding_hr, full_hr])))
+
+        if sliding_hr is not None and window_hrs:
+            return sliding_hr
+        return round(float(np.median(candidates)))
 
     def _try_append_hr(self):
+        if self.frame_count < 60 and len(self.face_green) < 60:
+            return
         rgb = self._valid_signal_rows()
         if rgb is None:
             return
@@ -773,14 +992,25 @@ class VitalsScanner:
             return
         keep = True
         if len(self.hrs) >= 3:
-            med = float(np.median(self.hrs[-10:]))
-            if abs(hr - med) > 16:
+            med = float(np.median(self.hrs[-12:]))
+            if abs(hr - med) > 12:
+                keep = False
+            if hr < med - 18 and hr < 62:
+                keep = False
+            ratio = hr / max(med, 1e-6)
+            if ratio > 1.55 or ratio < 0.62:
                 keep = False
         if keep:
             if len(self.hrs) > 300:
                 self.hrs.pop(0)
             self.hrs.append(hr)
-            self.latest_hr = round(moving_avg(self.hrs, 5)[-1]) if len(self.hrs) > 3 else hr
+            recent = [h for h in self.hrs[-8:] if 52 <= h <= 140]
+            if recent:
+                self.latest_hr = round(float(np.median(recent)))
+            elif len(self.hrs) > 2:
+                self.latest_hr = round(float(np.median(self.hrs[-5:])))
+            else:
+                self.latest_hr = hr
 
     def _trim_trace(self, trace, fs, skip_seconds=1.5):
         arr = np.asarray(trace, dtype=float)
@@ -832,10 +1062,27 @@ class VitalsScanner:
         except (ValueError, TypeError):
             return None
 
+    def _br_from_ml(self, fs):
+        if not ml_pulse_available():
+            return None, None
+        n_frames = max(self.frame_count, self.face_ok_frames)
+        rr_wave = self.ml_pulse.estimate_rr(fs, n_frames=n_frames)
+        rr_motion = self.ml_pulse.estimate_rr_motion(fs, n_frames=n_frames)
+        return rr_wave, rr_motion
+
     def _estimate_br(self, live_only=False):
         fs = max(self._effective_fps(), 3.0)
         min_n = min_rr_samples(fs, seconds=2.5)
         estimates = []
+
+        rr_ml_wave, rr_ml_motion = self._br_from_ml(fs)
+        if rr_ml_wave is not None:
+            estimates.extend([rr_ml_wave] * 5)
+        if rr_ml_motion is not None:
+            estimates.extend([rr_ml_motion] * 4)
+        if rr_ml_wave is not None and rr_ml_motion is not None:
+            if abs(rr_ml_wave - rr_ml_motion) <= 4:
+                estimates.extend([rr_ml_wave] * 3)
 
         green = self._trim_trace(self.br_green_trace, fs)
         motion = self._trim_trace(self.br_motion_trace, fs)
@@ -889,34 +1136,50 @@ class VitalsScanner:
         final_hr = None
         median_hr = None
         fallback_hr = None
+        hr_confidence = "low"
+        hr_spread = None
+
+        full_window_hr = self._estimate_hr_full_window()
 
         if len(self.hrs) > 0:
-            rgb = self._valid_signal_rows()
-            fft_hr = None
-            if rgb is not None and len(rgb) >= 15:
-                fft_hr = self._estimate_hr_from_rgb(rgb)
-            pool = self.hrs[-30:] if len(self.hrs) >= 30 else self.hrs
+            raw_pool = self.hrs[-40:] if len(self.hrs) >= 40 else self.hrs
+            pool = [h for h in raw_pool if 58 <= h <= 130]
+            if len(pool) < 3:
+                pool = [h for h in raw_pool if 52 <= h <= 140]
+            if len(pool) < 1:
+                pool = list(raw_pool)
             median_hr = round(float(np.median(pool)))
             trimmed = sorted(pool)
             if len(trimmed) > 4:
                 trimmed = trimmed[1:-1]
             trimmed_mean = round(float(np.mean(trimmed)))
-            fallback_hr = round(moving_avg(self.hrs, 8)[-1]) if len(self.hrs) > 7 else round(self.hrs[-1])
-            final_hr = median_hr
-            candidates = [median_hr, trimmed_mean, fallback_hr]
-            if fft_hr is not None:
-                candidates.append(fft_hr)
-            in_band = [c for c in candidates if 45 <= c <= 130]
-            if in_band:
-                final_hr = round(float(np.median(in_band)))
-            elif fft_hr is not None and abs(fft_hr - median_hr) <= 12:
-                final_hr = fft_hr
+            fallback_hr = round(float(np.median(pool[-8:]))) if len(pool) > 5 else round(pool[-1])
+
+            if full_window_hr is not None:
+                final_hr = full_window_hr
+                if pool:
+                    hr_spread = int(max(pool) - min(pool)) if len(pool) > 1 else 0
+                if pool and abs(full_window_hr - median_hr) <= 8:
+                    hr_confidence = "high"
+                elif pool and abs(full_window_hr - median_hr) <= 14:
+                    hr_confidence = "medium"
+                    final_hr = round(float(np.median([full_window_hr, median_hr])))
+                else:
+                    hr_confidence = "low"
+            else:
+                candidates = [c for c in (median_hr, trimmed_mean, fallback_hr) if c is not None]
+                spread = max(candidates) - min(candidates) if len(candidates) > 1 else 0
+                hr_confidence = "high" if spread <= 8 else ("medium" if spread <= 15 else "low")
+                final_hr = round(float(np.median(candidates))) if candidates else median_hr
         else:
-            fft_hr = self._hr_from_signal(fs)
-            if fft_hr is not None:
-                final_hr = fft_hr
-                median_hr = fft_hr
-                fallback_hr = fft_hr
+            final_hr = full_window_hr or self._hr_from_signal(fs)
+            if final_hr is not None:
+                median_hr = final_hr
+                fallback_hr = final_hr
+
+        if final_hr is None and full_window_hr is not None:
+            final_hr = full_window_hr
+            median_hr = full_window_hr
 
         if final_hr is None and self.latest_hr is not None:
             final_hr = self.latest_hr
@@ -931,6 +1194,11 @@ class VitalsScanner:
                     median_hr = hr_try
 
         final_br = self._estimate_br(live_only=False)
+        if final_br is None and ml_pulse_available():
+            fs_br = max(self._effective_fps(), 3.0)
+            rr_ml, _ = self._br_from_ml(fs_br)
+            if rr_ml is not None:
+                final_br = rr_ml
         if final_br is None and self.latest_br is not None:
             final_br = self.latest_br
         if final_br is None:
@@ -960,6 +1228,8 @@ class VitalsScanner:
             "signal_samples": int(min(self._signal_filled, self.signal_size)),
             "face_green_samples": len(self.face_green),
             "fps": round(fs, 2),
+            "hr_confidence": hr_confidence,
+            "hr_spread": hr_spread,
             "face_detected_pct": round(face_pct),
             "success": final_hr is not None or final_br is not None,
         }
