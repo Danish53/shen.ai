@@ -62,7 +62,7 @@ def _motion_from_crops(prev_rgb, curr_rgb):
 
 
 MIN_WAVE_SAMPLES = 48
-INFER_EVERY_N_FRAMES = 3
+INFER_EVERY_N_FRAMES = 4
 
 _MODEL_STATE: dict = {"model": None, "device": None, "ready": False, "error": None}
 
@@ -319,3 +319,18 @@ class DeepPulseEstimator:
     @property
     def motion_len(self):
         return len(self._motion_trace)
+
+    def get_waveform(self):
+        if len(self._waveform) < 8:
+            return None
+        return np.asarray(list(self._waveform), dtype=float)
+
+    def get_waveform_resampled(self, target_len):
+        wave = self.get_waveform()
+        if wave is None or target_len < 20:
+            return None
+        if len(wave) == target_len:
+            return wave
+        x_old = np.linspace(0.0, 1.0, len(wave))
+        x_new = np.linspace(0.0, 1.0, int(target_len))
+        return np.interp(x_new, x_old, wave).astype(float)

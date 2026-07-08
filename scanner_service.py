@@ -15,6 +15,7 @@ import torchvision.transforms as transforms
 from models import LinkNet34
 from pulse import Pulse
 from ml_pulse import DeepPulseEstimator, preload_deepphys, ml_pulse_available
+from bp_estimator import estimate_bp, preload_bp_model, bp_model_available
 from respiration import (
     estimate_rr_robust,
     estimate_rr_short,
@@ -114,11 +115,12 @@ class VitalsScanner:
         self.face_green.append(float(mean_bgr[1]))
         self._push_signal_sample(mean_bgr)
         self.frame_count += 1
-        if self._signal_filled % 5 == 0 and self._signal_filled >= 40:
+        if self._signal_filled % 5 == 0 and self._signal_filled >= 20:
             self._try_append_hr()
-        br = self._estimate_br(live_only=True)
-        if br is not None:
-            self.latest_br = br
+        if self._signal_filled % 12 == 0:
+            br = self._estimate_br(live_only=True)
+            if br is not None:
+                self.latest_br = br
         return True
 
     @classmethod
@@ -142,6 +144,7 @@ class VitalsScanner:
         _MODEL_CACHE["transform"] = transform
         _MODEL_CACHE["device"] = device
         preload_deepphys(device)
+        preload_bp_model(device)
 
     def _push_ml_frame(self, frame, scan_mask, chest_y0, forehead_roi=None):
         if not ml_pulse_available():
@@ -638,6 +641,48 @@ class VitalsScanner:
             orig = cv2.resize(orig, (640, int(h0 * scale)), interpolation=cv2.INTER_AREA)
         return orig
 
+    def _process_remote_scan_frame(self, frame_full, h, w, chest_y0, scan_mask, client_face_ok, forehead_roi):
+        """Fast browser scan path — skip LinkNet when MediaPipe forehead ROI is available."""
+        self._update_scan_fps()
+        now = time.time()
+        tracking_ok = client_face_ok is not False
+
+        if self._last_scan_tick is not None and tracking_ok:
+            self._scan_accumulated += min(now - self._last_scan_tick, 0.4)
+        self._last_scan_tick = now
+
+        if tracking_ok:
+            self.face_ok_frames += 1
+            self._sample_breathing_frame(
+                frame_full, scan_mask, chest_y0, None, forehead_roi,
+            )
+            self._push_ml_frame(frame_full, scan_mask, chest_y0, forehead_roi)
+            self._ingest_face_frame(frame_full, scan_mask, chest_y0, forehead_roi)
+
+        if self._scan_accumulated >= self.duration:
+            self._try_append_hr()
+            return {"type": "complete", **self._final_results()}
+
+        remaining = max(0, int(self.duration - self._scan_accumulated))
+        progress = min(100, int(((self.duration - remaining) / self.duration) * 100))
+        face_ok = tracking_ok and int(scan_mask[:chest_y0, :].sum()) > 25
+
+        return {
+            "type": "vitals",
+            "remaining": remaining,
+            "paused": not tracking_ok,
+            "face_ok": face_ok,
+            "condition_score": 85 if face_ok else 40,
+            "lighting_message": "",
+            "lighting_ok": True,
+            "progress": progress,
+            "overlay": None,
+            "scan_fps": round(self._effective_fps(), 1),
+            "live_hr": self.latest_hr,
+            "live_br": self.latest_br,
+            "frame": None,
+        }
+
     def process_frame(self, orig, client_face_ok=True, forehead_roi=None):
         """Process one camera frame — used for VPS (browser camera) and local webcam."""
         if self.model is None or self._img_transform is None:
@@ -646,12 +691,26 @@ class VitalsScanner:
         orig = self._prepare_frame(orig)
         shape = orig.shape[:2]
         scanning = not self.preview_mode and self.scan_start_time is not None
+        h, w = shape[0], shape[1]
+        chest_y0 = int(h * 0.45)
+
+        if self.remote_mode and scanning:
+            roi_mask = self._mask_from_forehead_roi(h, w, chest_y0, forehead_roi)
+            if roi_mask is not None and int(roi_mask.sum()) >= 40:
+                return self._process_remote_scan_frame(
+                    orig, h, w, chest_y0, roi_mask, client_face_ok, forehead_roi,
+                )
+            if client_face_ok is not False:
+                center_mask = self._center_face_mask(h, w, chest_y0)
+                return self._process_remote_scan_frame(
+                    orig, h, w, chest_y0, center_mask, client_face_ok, forehead_roi,
+                )
 
         self._frame_i += 1
         run_model = (
             self._last_pred is None
             or not scanning
-            or self._frame_i % 2 == 0
+            or self._frame_i % 4 == 0
         )
 
         if run_model:
@@ -876,7 +935,7 @@ class VitalsScanner:
         return hr if 52 <= hr <= 180 else None
 
     def _estimate_hr_from_rgb(self, rgb_means, fs_override=None):
-        if rgb_means is None or len(rgb_means) < 40:
+        if rgb_means is None or len(rgb_means) < 20:
             return None
         fs = max(float(fs_override) if fs_override else self._effective_fps(), 10.0)
         self.pulse.framerate = fs
@@ -946,8 +1005,8 @@ class VitalsScanner:
     def _estimate_hr_full_window(self):
         """Final HR — sliding windows + full trace + ML consensus."""
         rgb = self._valid_signal_rows()
-        if rgb is None or len(rgb) < 80:
-            if len(self.face_green) >= 80:
+        if rgb is None or len(rgb) < 40:
+            if len(self.face_green) >= 40:
                 g = np.asarray(self.face_green, dtype=float)
                 rgb = np.column_stack([g, g, g])
             else:
@@ -962,7 +1021,7 @@ class VitalsScanner:
             fs_override=fs,
         )
         hr_ml = None
-        if ml_pulse_available() and self.ml_pulse.waveform_len >= 80:
+        if ml_pulse_available() and self.ml_pulse.waveform_len >= 40:
             hr_ml = self.ml_pulse.estimate_hr(fs)
 
         candidates = [h for h in (sliding_hr, full_hr, hr_ml) if h is not None]
@@ -982,7 +1041,7 @@ class VitalsScanner:
         return round(float(np.median(candidates)))
 
     def _try_append_hr(self):
-        if self.frame_count < 60 and len(self.face_green) < 60:
+        if self.frame_count < 25 and len(self.face_green) < 25:
             return
         rgb = self._valid_signal_rows()
         if rgb is None:
@@ -1131,6 +1190,44 @@ class VitalsScanner:
                 return None
         return self._estimate_hr_from_rgb(rgb)
 
+    def _get_pulse_waveform(self, fs):
+        n_frames = max(len(self.face_green), self.frame_count)
+        if self._scan_accumulated > 2.0 and n_frames > 30:
+            fs = n_frames / self._scan_accumulated
+
+        if ml_pulse_available() and self.ml_pulse.waveform_len >= 60 and n_frames >= 60:
+            wave = self.ml_pulse.get_waveform_resampled(n_frames)
+            if wave is not None and len(wave) >= 60:
+                return wave, fs
+
+        rgb = self._valid_signal_rows()
+        if rgb is None or len(rgb) < 60:
+            if len(self.face_green) >= 60:
+                g = np.asarray(self.face_green, dtype=float)
+                rgb = np.column_stack([g, g, g])
+            else:
+                return None, fs
+        self.pulse.framerate = fs
+        old_sz = self.pulse.signal_size
+        try:
+            self.pulse.signal_size = len(rgb)
+            wave = moving_avg(self.pulse.get_pulse(rgb), 6)
+            return wave, fs
+        finally:
+            self.pulse.signal_size = old_sz
+
+    def _estimate_bp(self, fs, hr=None, br=None, age=None, sex=None):
+        if not bp_model_available():
+            preload_bp_model()
+        wave, use_fs = self._get_pulse_waveform(fs)
+        if wave is None:
+            return None
+        green = self._valid_green_trace()
+        return estimate_bp(
+            wave, use_fs, hr=hr, breathing_rate=br,
+            green_trace=green, age=age, sex=sex,
+        )
+
     def _final_results(self):
         fs = max(self._effective_fps(), 8.0)
         final_hr = None
@@ -1187,8 +1284,15 @@ class VitalsScanner:
 
         if final_hr is None:
             rgb = self._valid_signal_rows()
-            if rgb is not None and len(rgb) >= 15:
-                hr_try = self._estimate_hr_from_rgb(rgb)
+            n = len(self.face_green)
+            if rgb is None and n >= 20:
+                g = np.asarray(self.face_green, dtype=float)
+                rgb = np.column_stack([g, g, g])
+            if rgb is not None and len(rgb) >= 20:
+                use_fs = fs
+                if self._scan_accumulated > 1.5 and n >= 20:
+                    use_fs = max(n / self._scan_accumulated, 8.0)
+                hr_try = self._estimate_hr_from_rgb(rgb, fs_override=use_fs)
                 if hr_try is not None:
                     final_hr = hr_try
                     median_hr = hr_try
@@ -1204,7 +1308,7 @@ class VitalsScanner:
         if final_br is None:
             fs_br = max(self._effective_fps(), 3.0)
             for trace in (self.face_green, self.br_green_trace, self.br_motion_trace):
-                if len(trace) >= 50:
+                if len(trace) >= 25:
                     rr = estimate_rr_lenient(np.asarray(trace, dtype=float), fs_br)
                     if rr is not None:
                         final_br = round(rr)
@@ -1216,7 +1320,9 @@ class VitalsScanner:
 
         face_pct = (self.face_ok_frames / max(self.frame_count, 1)) * 100
 
-        return {
+        bp_result = self._estimate_bp(fs, hr=final_hr, br=final_br)
+
+        result = {
             "heart_rate": final_hr,
             "heart_rate_median": median_hr if median_hr is not None else final_hr,
             "heart_rate_fallback": fallback_hr if fallback_hr is not None else final_hr,
@@ -1233,6 +1339,9 @@ class VitalsScanner:
             "face_detected_pct": round(face_pct),
             "success": final_hr is not None or final_br is not None,
         }
+        if bp_result:
+            result.update(bp_result)
+        return result
 
     def run(self):
         try:

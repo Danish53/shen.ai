@@ -7,6 +7,10 @@ DEEPPHYS_WEIGHTS_URL = (
     "https://raw.githubusercontent.com/ubicomplab/rPPG-Toolbox/main/"
     "final_model_release/PURE_DeepPhys.pth"
 )
+WEIGHTS_DIR = BACKEND_DIR / "weights"
+BP_MODEL_PATH = WEIGHTS_DIR / "bp_regressor.pth"
+BP_WAVENET_PATH = WEIGHTS_DIR / "bp_wavenet.pth"
+BP_NORM_PATH = WEIGHTS_DIR / "bp_norm.json"
 OUTPUT_DIR = BACKEND_DIR / "output"
 IMAGES_DIR = BACKEND_DIR / "images"
 
